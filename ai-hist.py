@@ -16,15 +16,16 @@ warnings.filterwarnings('ignore')
 TARGET_PROFIT = 60.0  # 目标收益率
 
 # 固定参数
-FIXED_LOOKBACK = 600
-FIXED_TRAIN_MIN = 300
+FIXED_LOOKBACK = 400
+FIXED_TRAIN_MIN = 100
 
+# 参数网格：总组合数 = 72种
 PARAM_GRID = {
     # --- 交易执行层参数 ---
-    'trailing':   [1.5, 2.0, 2.5],       # 止盈宽松度
-    'buy_conf':   [0.60, 0.65],    # 买入信心门槛
-    'target_up':  [1.5, 2.0, 2.5],       # 贪婪度
-    'stop_down':  [1.0],                  # 容忍度
+    'trailing':   [1.5, 2, 2.5],       # 止盈宽松度
+    'buy_conf':   [0.6, 0.65],    # 买入信心门槛
+    'target_up':  [1.2, 1.6, 2, 2.4],       # 贪婪度
+    'stop_down':  [0.8, 1, 1.2],                  # 容忍度
     'risk_trig':  [0.6, 0.75, 0.9]        # 胆量
 }
 
@@ -34,7 +35,7 @@ PARAM_GRID = {
 INITIAL_CAPITAL = 100000.0   
 COMMISSION_RATE = 0.00015    
 MIN_COMMISSION  = 5.0        
-START_DATE      = "2025-01-01" 
+START_DATE      = "2025-08-01" 
 MAX_BULLETS     = 3      
 
 # 卖出风控
@@ -44,7 +45,8 @@ TRAILING_START  = 0.08
 AI_RISK_ALERT   = 0.85       
 
 # AI固定参数
-TRAIN_WINDOW    = 20         
+TRAIN_WINDOW    = 5   
+LOOK_BACK_WINDOW = 80        
 
 # 技术指标参数
 ATR_PERIOD      = 14         
@@ -175,7 +177,8 @@ def run_backtest_silent(code, full_df, params):
     
     for i in range(start_idx, total_len, TRAIN_WINDOW):
         if i < FIXED_TRAIN_MIN: continue
-        train_df = full_df.iloc[:i] 
+        start_train_index = max(0, i - LOOK_BACK_WINDOW)
+        train_df = full_df.iloc[start_train_index:i] 
         
         X_train = train_df[feature_cols].iloc[:-5]
         closes = train_df['收盘'].values
