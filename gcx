@@ -1,0 +1,446 @@
+import requests
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import HistGradientBoostingClassifier
+import warnings
+import json
+import sys
+from datetime import datetime, timedelta, timezone
+from openai import OpenAI
+
+warnings.filterwarnings('ignore')
+
+# ==============================================================================
+# ⚙️ 全局配置 (在此处统一修改核心参数)
+# ==============================================================================
+# 1. 模型训练窗口
+# 这里的数字表示：模型只学习“最近 X 天”的历史数据进行训练
+# 如果设为 None，则表示使用全部历史数据
+FIXED_TRAIN_WINDOW = 150  
+
+# 2. 数据与交易通用参数
+GLOBAL_LOOKBACK_DAYS = 400  # 向接口请求的历史数据总长度 (需 > FIXED_TRAIN_WINDOW)
+GLOBAL_MAX_BULLETS = 3      # 资金最大份数 (每次买入 1/N)
+GLOBAL_STOP_DOWN = 1.0      # 止损阈值 (ATR的倍数)
+
+# ==============================================================================
+# 🔑 API 配置 (请在此填入你的 Key)
+# ==============================================================================
+DEEPSEEK_API_KEY = "sk-5e49822fcb8649d88c847667cb41642d"  # 你的 DeepSeek Key
+BASE_URL = "https://api.deepseek.com"
+SERPER_API_KEY = "fa0849fb7ce91463287f65b7354caff449f3cab9"       # 你的 Serper Key
+
+# ==============================================================================
+# 策略配置 (仅保留标的特有参数)
+# ==============================================================================
+STRATEGIES = {
+    # 'gt_ndx': {
+    #     'code': 'sh513100',
+    #     'name': '国泰纳斯达克ETF',
+    #     'news_keywords': '纳斯达克 美股 科技股 人工智能',
+    #     'trailing_atr': 3,
+    #     'target_up': 1.6,
+    #     'risk_trig': 0.9,
+    #     'buy_conf': 0.6,
+    #     'portfolio': {
+    #         'total_capital': 30000.0,
+    #         'current_cash': 30000.0,
+    #         'hold_shares': 0,
+    #         'avg_cost': 0,
+    #         'highest_price': 0,
+    #         'units_used': 0
+    #     }
+    # },
+    # 'gold': {
+    #     'code': 'sh518880',
+    #     'name': '黄金ETF',
+    #     'news_keywords': '黄金 美联储 降息 战争 避险',
+    #     'trailing_atr': 2,
+    #     'target_up': 1.2,
+    #     'risk_trig': 0.9,
+    #     'buy_conf': 0.6,
+    #     'portfolio': {
+    #         'total_capital': 30000.0,
+    #         'current_cash': 30000.0,
+    #         'hold_shares': 900,
+    #         'avg_cost': 10.883,
+    #         'highest_price': 11.288,
+    #         'units_used': 1
+    #     }
+    # },
+    #  'ai': {
+    #     'code': 'sz159819',
+    #     'name': '人工智能ETF',
+    #     'news_keywords': '人工智能 算力 英伟达 纳斯达克 科技股',
+    #     'trailing_atr': 3,
+    #     'target_up': 1.2,
+    #     'risk_trig': 0.9,
+    #     'buy_conf': 0.6,
+    #     'portfolio': {
+    #         'total_capital': 30000.0,
+    #         'current_cash': 30000.0,
+    #         'hold_shares': 0,
+    #         'avg_cost': 0,
+    #         'highest_price': 0,
+    #         'units_used': 0
+    #     }
+    # },
+     'metal': {
+        'code': 'sh560860',
+        'name': '工业金属ETF',
+        'trailing_atr': 3,
+        'target_up': 1.2,
+        'risk_trig': 1.5,
+        'buy_conf': 0.55,
+        'news_keywords': '铜价 铝价 大宗商品 制造业',
+        'portfolio': {
+            'total_capital': 30000.0,
+            'current_cash': 30000.0,
+            'hold_shares': 2200,
+            'avg_cost': 2.191,
+            'highest_price': 2.228,
+            'units_used': 1
+        }
+    }
+}
+
+COMMISSION = 0.00015
+MIN_COMM = 5.0
+
+# ==============================================================================
+# 1. 数据处理模块
+# ==============================================================================
+
+def get_data(code, lookback):
+    """从腾讯接口获取数据"""
+    url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,{lookback},qfq"
+    try:
+        resp = requests.get(url, timeout=3).json()
+        raw = resp['data'][code].get('qfqday', resp['data'][code].get('day', []))
+        df = pd.DataFrame(raw).iloc[:, :6]
+        df.columns = ['日期', '开盘', '收盘', '最高', '最低', '成交量']
+        for c in df.columns[1:]:
+            df[c] = pd.to_numeric(df[c])
+        df['日期'] = pd.to_datetime(df['日期'])
+        return df
+    except Exception as e:
+        print(f"数据获取失败: {e}")
+        return None
+
+def calc_indicators(df):
+    """计算技术指标"""
+    # 基础指标
+    df['MA5'] = df['收盘'].rolling(5).mean()
+    df['MA20'] = df['收盘'].rolling(20).mean()
+    df['Trend_OK'] = df['MA5'] > df['MA20']
+    
+    # ATR
+    h_l = df['最高'] - df['最低']
+    h_c = (df['最高'] - df['收盘'].shift()).abs()
+    l_c = (df['最低'] - df['收盘'].shift()).abs()
+    df['ATR'] = pd.concat([h_l, h_c, l_c], axis=1).max(axis=1).rolling(14).mean()
+    df['NATR'] = df['ATR'] / df['收盘']
+    
+    # AI特征
+    df['Norm_MACD'] = (df['收盘'].ewm(span=12).mean() - df['收盘'].ewm(span=26).mean()).ewm(span=9).mean() * 2 / df['收盘']
+    delta = df['收盘'].diff()
+    gain = (delta.where(delta>0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta<0, 0)).rolling(14).mean()
+    df['RSI'] = 100 - (100 / (1 + gain/loss))
+    df['Bias'] = (df['收盘'] - df['MA20']) / df['MA20']
+    df['Vol_Ratio'] = df['成交量'] / df['成交量'].rolling(5).mean()
+    
+    # 增强特征
+    bb_std = df['收盘'].rolling(20).std()
+    df['BB_Pos'] = (df['收盘'] - (df['MA20']-2*bb_std)) / (4*bb_std)
+    
+    low9 = df['最低'].rolling(9).min()
+    high9 = df['最高'].rolling(9).max()
+    rsv = (df['收盘'] - low9) / (high9 - low9) * 100
+    df['K'] = rsv.ewm(com=2).mean()
+    df['KDJ_J'] = 3 * df['K'] - 2 * df['K'].ewm(com=2).mean()
+    
+    df['ROC'] = df['收盘'].pct_change(10) * 100
+    obv = np.where(df['收盘']>df['收盘'].shift(), df['成交量'], 
+          np.where(df['收盘']<df['收盘'].shift(), -df['成交量'], 0))
+    df['OBV_Slope'] = pd.Series(obv).cumsum().pct_change(5)
+    
+    return df.dropna()
+
+# ==============================================================================
+# 2. 机器学习模块 (支持固定窗口训练)
+# ==============================================================================
+
+def train_and_predict(df, cfg, train_window):
+    """
+    df: 包含历史数据到预测日前一天的全量 DataFrame
+    """
+    feature_cols = ['Norm_MACD', 'RSI', 'Bias', 'Vol_Ratio', 'NATR', 'BB_Pos', 'KDJ_J', 'ROC', 'OBV_Slope']
+    
+    # 1. 分离训练集和预测行
+    last_row = df.iloc[[-1]].copy() # 要预测的“明天”
+    train_df = df.iloc[:-1].copy()  # 历史数据
+    
+    # 2. 应用训练窗口截断
+    if train_window is not None and isinstance(train_window, int):
+        if len(train_df) > train_window:
+            train_df = train_df.iloc[-train_window:]
+    
+    # 3. 准备 X_train (去掉最后5天因为无法打标签)
+    X_train = train_df[feature_cols].iloc[:-5] 
+    
+    closes = train_df['收盘'].values
+    atrs = train_df['ATR'].values
+    highs = train_df['最高'].values
+    lows = train_df['最低'].values
+    
+    buy_y, sell_y = [], []
+    v_len = len(train_df) - 5
+    
+    if v_len <= 10:
+        print("  ⚠️ 警告：有效训练数据过少，预测可能不稳定！")
+
+    # 4. 标注历史数据 (Labeling)
+    for k in range(v_len):
+        c, a = closes[k], atrs[k]
+        t_up = c + a * cfg['target_up']
+        # 使用全局变量 GLOBAL_STOP_DOWN
+        s_down = c - a * GLOBAL_STOP_DOWN
+        risk_trig = c - a * cfg['risk_trig']
+        
+        # 标注买入
+        is_buy = 0
+        if np.max(highs[k+1:k+6]) >= t_up:
+            is_buy = 1
+        elif np.min(lows[k+1:k+6]) <= s_down:
+            is_buy = 0
+        buy_y.append(is_buy)
+        
+        # 标注风险
+        is_risk = 1 if np.min(lows[k+1:k+6]) <= risk_trig else 0
+        sell_y.append(is_risk)
+        
+    m_buy = HistGradientBoostingClassifier(max_depth=4).fit(X_train, buy_y)
+    m_sell = HistGradientBoostingClassifier(max_depth=4).fit(X_train, sell_y)
+    
+    buy_prob = m_buy.predict_proba(last_row[feature_cols])[:, 1][0]
+    sell_prob = m_sell.predict_proba(last_row[feature_cols])[:, 1][0]
+    
+    return buy_prob, sell_prob
+
+# ==============================================================================
+# 3. 新闻侦探模块
+# ==============================================================================
+
+def get_sentiment_from_news(target_name, keywords, target_date=None):
+    if target_date:
+        simulated_now_str = f"{target_date} 23:59:59"
+        search_query = f"{keywords} {target_date}"
+        time_filter = None 
+        print(f"🌍 正在回溯搜索【{target_name}】在 {target_date} 附近的新闻...")
+    else:
+        utc_now = datetime.now(timezone.utc)
+        beijing_now = utc_now + timedelta(hours=8)
+        simulated_now_str = beijing_now.strftime("%Y-%m-%d %H:%M")
+        search_query = keywords
+        time_filter = "qdr:d" 
+        print(f"🌍 正在连接 Google News 搜索【{target_name}】最新新闻...")
+    
+    url = "https://google.serper.dev/news"
+    
+    payload_dict = { "q": search_query, "gl": "cn", "hl": "zh-cn", "num": 5 }
+    if time_filter: payload_dict["tbs"] = time_filter
+
+    payload = json.dumps(payload_dict)
+    headers = { 'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json' }
+
+    try:
+        response = requests.request("POST", url, headers=headers, data=payload)
+        results = response.json().get('news', [])
+        
+        if not results:
+            print("❌ 未搜索到相关新闻。")
+            return None
+        
+        news_text = ""
+        for i, res in enumerate(results):
+            time_tag = res.get('date', '未知时间')
+            news_text += f"[{i+1}] ({time_tag}) {res['title']}: {res.get('snippet', '')}\n"
+            
+    except Exception as e:
+        print(f"❌ Serper 搜索出错: {e}")
+        return None
+
+    prompt = f"""
+    你是一位资深量化交易员。
+    【重要】：假设现在的时间是【{simulated_now_str}】。
+    请忽略所有晚于此时间的知识，只根据提供的新闻摘要分析。
+    
+    关于【{target_name}】的新闻摘要：
+    {news_text}
+    
+    任务：
+    1. 提取每条新闻对该标的的利空/利多逻辑。
+    2. 给出该标的短期（未来3-5天）的综合情绪评分。
+    
+    请严格输出 JSON：
+    {{
+        "news_details": [
+            {{"time": "新闻时间", "summary": "摘要", "impact": "利多/利空/中性"}}
+        ],
+        "bullish_pct": 0-100 (整数),
+        "final_reason": "一句话总结"
+    }}
+    """
+    
+    try:
+        client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=BASE_URL)
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": "Output valid JSON only."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={ "type": "json_object" }
+        )
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        print(f"❌ LLM 调用失败: {e}")
+        return None
+
+# ==============================================================================
+# 4. 核心决策调度
+# ==============================================================================
+
+def make_decision(strategy_key, target_date_str=None, fetch_news=False):
+    cfg = STRATEGIES[strategy_key]
+    pf = cfg['portfolio']
+    
+    # 1. 获取全量数据 (使用全局 GLOBAL_LOOKBACK_DAYS)
+    df_full = get_data(cfg['code'], GLOBAL_LOOKBACK_DAYS)
+    if df_full is None: return
+
+    # 计算指标
+    df_full = calc_indicators(df_full)
+
+    # 时间旅行切片
+    if target_date_str:
+        target_dt = pd.to_datetime(target_date_str)
+        df = df_full[df_full['日期'] <= target_dt].copy()
+        if df.empty:
+            print(f"❌ 错误：在 {target_date_str} 之前没有数据。")
+            return
+        real_last_date = df['日期'].iloc[-1]
+        if real_last_date != target_dt:
+            print(f"⚠️ 注意：目标日期 {target_date_str} 休市，使用前一交易日: {real_last_date.date()}")
+    else:
+        df = df_full.copy()
+    
+    last_row = df.iloc[-1]
+    last_date_display = last_row['日期'].date()
+    
+    print("="*60)
+    print(f"🚀 标的: {cfg['name']} | 日期: {last_date_display}")
+    if FIXED_TRAIN_WINDOW:
+        print(f"🧠 模型记忆限制: 仅使用最近 {FIXED_TRAIN_WINDOW} 天数据训练")
+    else:
+        print(f"🧠 模型记忆模式: 使用全部可用历史数据 ({len(df)}天)")
+    print(f"📊 收盘: {last_row['收盘']:.3f} | ATR: {last_row['ATR']:.3f}")
+    
+    # 2. 技术面 AI 预测 (传入全局配置的窗口大小)
+    print("🤖 启动机器学习模型...")
+    tech_buy_prob, tech_sell_prob = train_and_predict(df, cfg, FIXED_TRAIN_WINDOW)
+    
+    # 3. 消息面
+    sentiment = None
+    if fetch_news:
+        sentiment = get_sentiment_from_news(cfg['name'], cfg.get('news_keywords', cfg['name']), target_date_str)
+    else:
+        print("🔕 消息面: 已跳过 (未输入 news 参数，默认中性)")
+    
+    # 4. 综合打分
+    news_bullish = 50 
+    news_reason = "无有效新闻数据"
+    if sentiment:
+        news_bullish = sentiment.get('bullish_pct', 50)
+        news_reason = sentiment.get('final_reason', '未知')
+        print("\n📰 新闻分析摘要:")
+        for item in sentiment.get('news_details', []):
+            flag = "🔴" if "利多" in item['impact'] else ("🟢" if "利空" in item['impact'] else "⚪")
+            print(f"   {flag} {item.get('summary')[:40]}...")
+
+    final_score = (tech_buy_prob * 0.6) + ((news_bullish / 100) * 0.4)
+    
+    print("\n" + "-" * 50)
+    print(f"📈 技术面: 买入概率 {tech_buy_prob:.2f} | 风险概率 {tech_sell_prob:.2f} | MA5: {last_row['MA5']:.2f} vs MA20: {last_row['MA20']:.2f}")
+    if sentiment:
+        print(f"🌍 消息面: 看多程度 {news_bullish}% | 观点: {news_reason}")
+    else:
+        print(f"🌍 消息面: 50% (默认中性)")
+        
+    print("-" * 50)
+    print(f"⚖️  最终评分: {final_score:.2f}")
+    
+    # 交易建议
+    sell_signal = False
+    buy_signal = False
+    reason = ""
+    
+    if (tech_sell_prob > 0.85) or (tech_sell_prob > 0.7 and news_bullish < 30):
+        sell_signal = True
+        reason = f"风控共振 (风险率:{tech_sell_prob:.2f})"
+        
+    if not sell_signal:
+        risk_pass = (tech_sell_prob < 0.85)
+        trend_ok = last_row['Trend_OK']
+        if trend_ok and (final_score > cfg['buy_conf']) and risk_pass:
+            buy_signal = True
+            reason = f"信号触发 (分{final_score:.2f})"
+
+    # 使用全局变量 GLOBAL_MAX_BULLETS
+    if sell_signal:
+        print(f"\n📢 建议: 【卖出/清仓】 💡 {reason}")
+    elif buy_signal:
+        # 检查仓位是否已满
+        if pf['units_used'] < GLOBAL_MAX_BULLETS:
+            print(f"\n📢 建议: 【买入/加仓】 💡 {reason}")
+            # 简单的资金计算展示
+            per_share = pf['total_capital'] / GLOBAL_MAX_BULLETS
+            print(f"   建议金额: {per_share:.0f} 元 (第 {pf['units_used']+1}/{GLOBAL_MAX_BULLETS} 笔)")
+        else:
+            print(f"\n🧘 建议: 【持有】 💡 {reason} (但仓位已满 {GLOBAL_MAX_BULLETS}/{GLOBAL_MAX_BULLETS})")
+    else:
+        print(f"\n🧘 建议: 【观望】")
+
+# ==============================================================================
+# 主程序入口
+# ==============================================================================
+
+if __name__ == "__main__":
+    # 使用方式: 
+    # 1. python strategy.py (不查新闻)
+    # 2. python strategy.py news (查新闻)
+    # 3. python strategy.py 2024-05-20 (不查新闻)
+    # 4. python strategy.py 2024-05-20 news (查新闻)
+    
+    target_date_arg = None
+    fetch_news_arg = False
+
+    # 解析所有参数
+    args = sys.argv[1:]
+    for arg in args:
+        if arg.lower() == 'news':
+            fetch_news_arg = True
+        else:
+            # 尝试识别日期
+            try:
+                pd.to_datetime(arg)
+                target_date_arg = arg
+            except:
+                pass
+
+    print(f"🖥️ 系统启动 | 目标日期: {target_date_arg if target_date_arg else 'Today'} | 消息面分析: {'✅ 开启' if fetch_news_arg else '❌ 关闭'}")
+    
+    for strategy_key in STRATEGIES.keys():
+        make_decision(strategy_key, target_date_str=target_date_arg, fetch_news=fetch_news_arg)
+        print("\n\n")
